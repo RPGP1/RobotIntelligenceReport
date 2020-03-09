@@ -395,5 +395,35 @@ void convolution2D_update(
 
     bias -= learning_rate * bias_grad;
 }
+template <class Scalar,
+    size_t in_channels, size_t out_channels,
+    int kernel_rows, int kernel_cols>
+void convolution2D_update(
+    std::array<std::array<Eigen::Array<Scalar, kernel_rows, kernel_cols>, in_channels>, out_channels>& weight,
+    Eigen::Array<Scalar, static_cast<int>(out_channels), 1>& bias,
+    std::array<std::array<Eigen::Array<Scalar, kernel_rows, kernel_cols>, in_channels>, out_channels>& weight_momentum,
+    Eigen::Array<Scalar, static_cast<int>(out_channels), 1>& bias_momentum,
+    std::array<std::array<Eigen::Array<Scalar, kernel_rows, kernel_cols>, in_channels>, out_channels> const& weight_grad,
+    Eigen::Array<Scalar, static_cast<int>(out_channels), 1> const& bias_grad,
+    Scalar const& learning_rate, Scalar const& momentum_rate)
+{
+    for (size_t out_channel_idx = 0; out_channel_idx < out_channels; out_channel_idx++) {
+        auto& weight_out_channel = weight.at(out_channel_idx);
+        auto& weight_momentum_out_channel = weight_momentum.at(out_channel_idx);
+        auto const& weight_grad_out_channel = weight_grad.at(out_channel_idx);
+
+        for (size_t in_channel_idx = 0; in_channel_idx < in_channels; in_channel_idx++) {
+            auto& weight_momentum_channel = weight_momentum_out_channel.at(in_channel_idx);
+
+            weight_momentum_channel *= momentum_rate;
+            weight_momentum_channel += weight_grad_out_channel.at(in_channel_idx);
+            weight_out_channel.at(in_channel_idx) -= learning_rate * weight_momentum_channel;
+        }
+    }
+
+    bias_momentum *= momentum_rate;
+    bias_momentum += bias_grad;
+    bias -= learning_rate * bias_momentum;
+}
 
 }  // namespace RobotIntelligence

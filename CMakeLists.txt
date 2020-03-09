@@ -49,6 +49,9 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
     target_compile_definitions(eigen INTERFACE -DEIGEN_NO_DEBUG)
 endif()
 
+add_library(cmdline INTERFACE)
+target_include_directories(cmdline SYSTEM INTERFACE "${CMAKE_CURRENT_LIST_DIR}/external/cmdline")
+
 
 file(GLOB children RELATIVE "${CMAKE_CURRENT_LIST_DIR}" *)
 foreach(child ${children})

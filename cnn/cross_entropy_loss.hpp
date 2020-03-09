@@ -9,8 +9,6 @@
 #include <iterator>
 #include <numeric>
 
-#include <iostream>
-
 
 namespace RobotIntelligence
 {

@@ -1,145 +1,232 @@
-#include "./convolution2d.hpp"
-#include "./cross_entropy_loss.hpp"
+#include "./cnn.hpp"
 #include "./declaration.hpp"
-#include "./linear.hpp"
-#include "./relu.hpp"
-#include "./reshape.hpp"
+
+#include <cmdline.h>
 
 #include <Eigen/Core>
 
 #include <array>
-#include <limits>
-
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <random>
+#include <string>
+#include <vector>
 
 
-struct CNN {
-    using Scalar = double;
-
-    CNN()
-    {
-        constexpr auto conv1_scale = sqrt(1 * 5 * 5);
-        for (auto& out_channel : conv1_weight) {
-            for (auto& channel : out_channel) {
-                channel.setRandom();
-                channel /= conv1_scale;
-            }
-        }
-        conv1_bias.setRandom();
-        conv1_bias /= conv1_scale;
-
-        constexpr auto conv2_scale = sqrt(5 * 5 * 5);
-        for (auto& out_channel : conv2_weight) {
-            for (auto& channel : out_channel) {
-                channel.setRandom();
-                channel /= conv2_scale;
-            }
-        }
-        conv2_bias.setRandom();
-        conv2_bias /= conv2_scale;
-
-        constexpr auto linear_scale = sqrt(490);
-        linear_weight.setRandom();
-        linear_weight /= linear_scale;
-    }
-
-    Scalar train(
-        RobotIntelligence::EigenSTLVector<std::array<Eigen::Array<Scalar, 28, 28>, 1>> const& input,
-        RobotIntelligence::EigenSTLVector<std::array<Eigen::Array<Scalar, 10, 1>, 1>> const& output,
-        Scalar const& learning_rate)
-    {
-        using namespace RobotIntelligence;
-
-        auto conv2_input = convolution2D<2, 2>(input, conv1_weight, conv1_bias);
-        ReLu_inplace(conv2_input);
-        auto linear_input = asVector(convolution2D<2, 2>(conv2_input, conv2_weight, conv2_bias));
-        ReLu_inplace(linear_input);
-        auto loss_input = linear(linear_input, linear_weight, linear_bias);
-
-        Scalar loss;
-        auto linear_output_grad = cross_entropy_loss_backpropagation(loss_input, output, loss);
-
-        auto conv2_output_grad = asRect<7, 7>(positiveMask(linear_backpropagation(linear_output_grad, linear_weight), linear_input));
-        auto conv1_output_grad = positiveMask(convolution2D_backpropagation<2, 2, 1>(conv2_output_grad, conv2_weight), conv2_input);
-
-        convolution2D_update(conv1_weight, conv1_bias, convolution2D_weight_grad<2, 2>(input, conv1_weight, conv1_output_grad), convolution2D_bias_grad(conv1_output_grad), learning_rate);
-        convolution2D_update(conv2_weight, conv2_bias, convolution2D_weight_grad<2, 2>(conv2_input, conv2_weight, conv2_output_grad), convolution2D_bias_grad(conv2_output_grad), learning_rate);
-        linear_weight -= learning_rate * linear_weight_grad(linear_input, linear_output_grad);
-
-        return loss;
-    }
-
-private:
-    std::array<std::array<Eigen::Array<Scalar, 5, 5>, 1>, 5> conv1_weight;
-    Eigen::Array<Scalar, 5, 1> conv1_bias;
-
-    std::array<std::array<Eigen::Array<Scalar, 5, 5>, 5>, 10> conv2_weight;
-    Eigen::Array<Scalar, 10, 1> conv2_bias;
-
-    Eigen::Array<Scalar, 10, 490> linear_weight;
-    const Eigen::Array<Scalar, 10, 1> linear_bias{Eigen::Array<Scalar, 10, 1>::Zero()};
+void swap_endian(uint32_t& val)
+{
+    val = ((val << 8) & 0xFF00FF00) | ((val >> 8) & 0xFF00FF);
+    val = (val << 16) | (val >> 16);
 };
 
-
-int main()
+uint32_t image_file_check(std::istream& ifs)
 {
+    uint32_t magic, image_number, rows, cols;
+
+    ifs.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    ifs.read(reinterpret_cast<char*>(&image_number), sizeof(image_number));
+    ifs.read(reinterpret_cast<char*>(&rows), sizeof(rows));
+    ifs.read(reinterpret_cast<char*>(&cols), sizeof(cols));
+    swap_endian(magic);
+    swap_endian(image_number);
+    swap_endian(rows);
+    swap_endian(cols);
+
+    assert(magic == 2051);
+    assert(rows == 28);
+    assert(cols == 28);
+
+    return image_number;
+}
+
+uint32_t label_file_check(std::istream& ifs)
+{
+    uint32_t magic, image_number;
+
+    ifs.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    ifs.read(reinterpret_cast<char*>(&image_number), sizeof(image_number));
+    swap_endian(magic);
+    swap_endian(image_number);
+
+    assert(magic == 2049);
+
+    return image_number;
+}
+
+
+int main(int argc, char* argv[])
+{
+    // commmand line options --------------------
+    cmdline::parser parser;
+    parser.add<std::string>("data", 'd', "directory containing mnist data");
+    parser.add<std::string>("output", 'o', "directory to output model parameters and log", false, "result");
+    parser.add<unsigned int>("batch", 'b', "batch size", false, 100);
+    parser.add<unsigned int>("epoch", 'e', "the number of epochs", false, 100);
+    parser.add<unsigned int>("save_interval", 'i', "interval of saving model parameters (specified by epoch number)", false, 1);
+    parser.add<unsigned int>("model", 'm', "model parameters to load (specified by epoch number)", false, 0);
+    parser.add<double>("learning_rate", 'l', "learning rate", false, 0.001, cmdline::range(0.0, 1.0));
+    parser.add<double>("momentum_rate", 0, "momentum rate", false, 0.9, cmdline::range(0.0, 1.0));
+    parser.add<double>("noise_rate", 'n', "noise rate", false, 0.0, cmdline::range(0.0, 1.0));
+    parser.add("help", 'h', "show this description");
+
+    if (!parser.parse(argc, argv) || parser.exist("help")) {
+        std::cout << parser.error_full() << parser.usage();
+        return EXIT_FAILURE;
+    }
+
+
+    // mnist data --------------------
+    const std::filesystem::path data_dir{parser.get<std::string>("data")};
+
+    std::ifstream stream_train_images{data_dir / "train-images-idx3-ubyte", std::ios_base::binary};
+    std::ifstream stream_train_labels{data_dir / "train-labels-idx1-ubyte", std::ios_base::binary};
+    std::ifstream stream_test_images{data_dir / "t10k-images-idx3-ubyte", std::ios_base::binary};
+    std::ifstream stream_test_labels{data_dir / "t10k-labels-idx1-ubyte", std::ios_base::binary};
+
+    const uint32_t train_image_number{image_file_check(stream_train_images)};
+    const uint32_t test_image_number{image_file_check(stream_test_images)};
+    {
+        [[maybe_unused]] const uint32_t train_image_number_check { label_file_check(stream_train_labels) };
+        [[maybe_unused]] const uint32_t test_image_number_check { label_file_check(stream_test_labels) };
+        assert(train_image_number == train_image_number_check);
+        assert(test_image_number == test_image_number_check);
+    }
+
+    const auto header_train_images = static_cast<unsigned int>(stream_train_images.tellg());
+    const auto header_train_labels = static_cast<unsigned int>(stream_train_labels.tellg());
+    const auto header_test_images = static_cast<unsigned int>(stream_test_images.tellg());
+    const auto header_test_labels = static_cast<unsigned int>(stream_test_labels.tellg());
+
+    constexpr auto image_seek = 28 * 28;
+    constexpr auto label_seek = 1;
+
+
+    // output --------------------
+    const std::filesystem::path output_dir{parser.get<std::string>("output")};
+    const auto output_model_dir = output_dir / "model";
+    std::filesystem::create_directories(output_model_dir);
+    std::ofstream output_log{output_dir / "test.log", std::ios_base::binary | std::ios_base::app};
+
+
+    // train --------------------
     using namespace RobotIntelligence;
 
     CNN cnn;
 
-    constexpr auto data_size = 60000;
-
-    EigenSTLVector<std::array<
-        Eigen::Array<double, 28, 28>,
-        1>>
-        input(data_size);
-    {
-        for (auto& in_batch : input) {
-            in_batch.at(0).setRandom();
-        }
+    auto const epoch_begin = parser.get<unsigned int>("model");
+    auto const epoch_end = epoch_begin + parser.get<unsigned int>("epoch");
+    if (epoch_begin == 0) {
+        cnn.set_random();
+    } else {
+        cnn.load(output_model_dir / (std::to_string(epoch_begin) + ".dat"));
     }
 
-    EigenSTLVector<std::array<
-        Eigen::Array<double, 10, 1>,
-        1>>
-        output(data_size);
-    {
-        for (auto batch_idx = 0; batch_idx < data_size; batch_idx++) {
-            output.at(batch_idx).at(0).setZero();
-            output.at(batch_idx).at(0)(batch_idx % 10) = 1;
-        }
-    }
+    auto const save_interval = parser.get<unsigned int>("save_interval");
+    auto const batches = parser.get<unsigned int>("batch");
+    auto const learning_rate = parser.get<double>("learning_rate");
+    auto const momentum_rate = parser.get<double>("momentum_rate");
+    auto const noise_rate = parser.get<double>("noise_rate");
 
+    EigenSTLVector<std::array<Eigen::Array<double, 28, 28>, 1>> input;
+    EigenSTLVector<std::array<Eigen::Array<double, 10, 1>, 1>> answer;
+    std::vector<uint8_t> test_answer;
 
-    constexpr auto batches = 100;
+    std::default_random_engine engine;
+    std::uniform_real_distribution noise_flag{-noise_rate, 1 - noise_rate};
+    std::uniform_int_distribution noise_value{0, 255};
+    std::vector<unsigned int> train_image_indices(train_image_number);
+    std::vector<unsigned int> test_image_indices(test_image_number);
+    std::iota(train_image_indices.begin(), train_image_indices.end(), (unsigned int){0});
+    std::iota(test_image_indices.begin(), test_image_indices.end(), (unsigned int){0});
 
-    EigenSTLVector<std::array<
-        Eigen::Array<double, 28, 28>,
-        1>>
-        in_batch(batches);
-    EigenSTLVector<std::array<
-        Eigen::Array<double, 10, 1>,
-        1>>
-        out_batch(batches);
-
-    for (auto epoch = 0; epoch < 100; epoch++) {
-        double loss = 0;
-
-        for (auto i = 0; i < 600; i++) {
-            std::copy(
-                input.begin() + batches * i,
-                input.begin() + batches * (i + 1),
-                in_batch.begin());
-            std::copy(
-                output.begin() + batches * i,
-                output.begin() + batches * (i + 1),
-                out_batch.begin());
-
-            loss = cnn.train(in_batch, out_batch, 0.01);
+    auto epoch = epoch_begin;
+    for (; epoch < epoch_end; epoch++) {
+        if (epoch % save_interval == 0 && epoch != epoch_begin) {
+            cnn.save(output_model_dir / (std::to_string(epoch) + ".dat"));
         }
 
-        std::cout << loss << std::endl;
+
+        {
+            std::shuffle(train_image_indices.begin(), train_image_indices.end(), engine);
+
+            unsigned int image_count = 0;
+            for (; image_count < train_image_number;) {
+                auto this_batches = std::min({batches, train_image_number - image_count});
+                input.resize(this_batches);
+                answer.resize(this_batches);
+
+                for (unsigned int batch_idx = 0; batch_idx < this_batches; batch_idx++) {
+                    auto& in_channel = input.at(batch_idx).at(0);
+                    auto& ans_channel = answer.at(batch_idx).at(0);
+
+                    stream_train_images.seekg(header_train_images + image_seek * train_image_indices.at(image_count + batch_idx));
+                    stream_train_labels.seekg(header_train_labels + label_seek * train_image_indices.at(image_count + batch_idx));
+
+                    for (auto pixel_idx = 0; pixel_idx < image_seek; pixel_idx++) {
+                        in_channel.data()[pixel_idx] = static_cast<double>(stream_train_images.get());
+
+                        if (noise_flag(engine) < 0) {
+                            in_channel.data()[pixel_idx] = noise_value(engine);
+                        }
+                    }
+                    in_channel /= 255;
+
+                    auto label = stream_train_labels.get();
+                    ans_channel.setZero();
+                    ans_channel(label) = 1;
+                }
+
+                auto loss = cnn.train(input, answer, learning_rate, momentum_rate);
+
+                image_count += this_batches;
+
+                std::cout << "epoch " << epoch + 1 << ": [" << image_count << '/' << train_image_number << ']'
+                          << " loss = " << loss << std::endl;
+            }
+        }
+
+
+        {
+            std::shuffle(test_image_indices.begin(), test_image_indices.end(), engine);
+
+            unsigned int image_count = 0;
+            size_t correct_count = 0;
+            for (; image_count < test_image_number;) {
+                auto this_batches = std::min({batches, test_image_number - image_count});
+                input.resize(this_batches);
+                test_answer.resize(this_batches);
+
+                for (unsigned int batch_idx = 0; batch_idx < this_batches; batch_idx++) {
+                    auto& in_channel = input.at(batch_idx).at(0);
+                    auto& ans_batch = test_answer.at(batch_idx);
+
+                    stream_test_images.seekg(header_test_images + image_seek * test_image_indices.at(image_count + batch_idx));
+                    stream_test_labels.seekg(header_test_labels + label_seek * test_image_indices.at(image_count + batch_idx));
+
+                    for (auto pixel_idx = 0; pixel_idx < image_seek; pixel_idx++) {
+                        in_channel.data()[pixel_idx] = static_cast<double>(stream_test_images.get());
+
+                        if (noise_flag(engine) < 0) {
+                            in_channel.data()[pixel_idx] = noise_value(engine);
+                        }
+                    }
+                    in_channel /= 255;
+
+                    ans_batch = static_cast<uint8_t>(stream_test_labels.get());
+                }
+
+                correct_count += cnn.test(input, test_answer);
+
+                image_count += this_batches;
+            }
+
+            auto rate = static_cast<double>(correct_count) / static_cast<double>(test_image_number);
+            std::cout << "epoch " << epoch + 1 << ": TEST " << rate << std::endl;
+            output_log << epoch + 1 << '\t' << rate << std::endl;
+        }
     }
+    cnn.save(output_model_dir / (std::to_string(epoch) + ".dat"));
 
 
     return 0;
